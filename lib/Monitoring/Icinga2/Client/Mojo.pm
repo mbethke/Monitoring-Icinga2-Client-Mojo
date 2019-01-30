@@ -4,9 +4,12 @@ use strictures 2;
 use Mojo::Base 'Mojo::UserAgent';
 use Carp;
 use Mojo::UserAgent;
+use Mojo::Promise;
 use JSON;
 use YAML::XS;   # TODO remove
+use Data::Dumper;   # TODO remove
 use List::Util qw/ all any first /;
+use Sub::Quote qw/ quote_sub /;
 use constant DEBUG => $ENV{DEBUG};
 our $VERSION = "v0.0.1";    # TODO
 
@@ -21,33 +24,26 @@ sub new {
     return $self;
 }
 
-sub i2req {
-    my ( $self, $method, $path, $params, $data, $cb ) = @_;
-    my $result_cb;
-    # Any callback already receives the decoded body
-    $cb and $result_cb = sub {
-        $cb->( decode_json( $_[1]->result->body ) );
-    };
-    my $tx = $self->_start_i2req( $method, $path, $params, $data, $result_cb );
-
-    return $tx if $cb;
-    my $res = $tx->result;
-    unless( $res->is_success ) {
-        die $res->message;  # TODO Exception::Class
-    }
-    return $res->json;
+sub i2req_p {
+    my $self = shift;
+    return $self->_start_i2req_p( @_ )->then(
+        sub { decode_json( shift->result->body ) },
+    );
 }
 
-sub _start_i2req {
-    my ( $self, $method, $path, $params, $data, $result_cb, $streaming_cb ) = @_;
+sub i2req {
+    my $self = shift;
+    my @result;
+    $self->i2req_p( @_ )->then( sub { @result = @_ } )->wait;
+    return @result;
+}
 
-    my $url = $self->_urlobj;
-    $path =~ s!^/!!;
-    $url->path->merge( $path );
-    $url->query->merge( @$params ) if defined $params;
+sub _start_i2req_p {
+    my ( $self, $method, $path, $params, $data, $streaming_cb ) = @_;
+
     my $tx = $self->build_tx(
         $method,
-        $url,
+        $self->_urlobj( $path, $params ),
         { Accept => 'application/json' },
         ( $data ? (json => $data) : () )
     );
@@ -56,105 +52,107 @@ sub _start_i2req {
             read => _callback_by_line( $streaming_cb ),
         );
     }
-    return $self->start( $tx, $result_cb );
+    return $self->start_p( $tx );
 }
 
-sub schedule_downtime {
+sub schedule_downtime_p {
     my $self = shift;
     my %objects = @_;
-    delete @objects{qw/ start_time end_time comment author duration fixed callback /};
-    return $self->schedule_downtimes( @_, objects => [ \%objects ] );
+    delete @objects{qw/ start_time end_time comment author duration fixed /};
+    return $self->schedule_downtimes_p( @_, objects => [ \%objects ] );
 }
 
-sub schedule_downtimes {
+sub schedule_downtimes_p {
     my ($self, %args) = @_;
     _checkargs(\%args, qw/ start_time end_time comment objects /);
     # uncoverable condition true
     $args{author} //= $self->author;
     ref $args{objects} eq 'ARRAY' or croak("`objects' arg must be an arrayref");
     my $filters = $self->_create_downtime_filters( $args{objects} );
-    say STDERR "FILTERS: ",Dump($filters);
 
-    if( $args{callback} ) {
-        my $delay = Mojo::IOLoop->delay;
-        $self->_schedule_downtime_type( 'Host', $filters->{Host}, \%args,  sub { say STDERR "PASSCB1: ",Dump(\@_); $delay->pass(@_) } );
-        $self->_schedule_downtime_type( 'Service', $filters->{Service}, \%args, sub { say STDERR "PASSCB2: ",Dump(\@_); $delay->pass(@_) } );
-        return;
-    }
-
-    return [
-        @{ $self->_schedule_downtime_type( 'Host', $filters->{Host}, \%args ) },
-        @{ $self->_schedule_downtime_type( 'Service', $filters->{Service}, \%args ) },
-    ];
+    return Mojo::Promise->all(
+        map { $self->_schedule_downtime_type( $_, $filters, \%args ) } qw/ Host Service /
+    )->then(
+        sub {
+            return [
+                map { @$_ } grep { defined } $_[0][0], $_[1][0]
+            ]
+        }
+    );
 }
 
 sub _schedule_downtime_type {
-    my ($self, $type, $filter, $args, $cb) = @_;
-    return $cb->( [] ) unless $filter;
-    return $self->_i2req_pd('POST',
+    my ($self, $type, $filters, $args) = @_;
+    return unless $filters->{$type};
+    return $self->_i2req_pd_p('POST',
         '/actions/schedule-downtime',
         {
             type => $type,
             joins => [ "host.name" ],
-            filter => $filter,
+            filter => $filters->{$type},
             map { $_ => $args->{$_} } qw/ author start_time end_time comment duration fixed /
         },
-        $cb,
     );
 }
 
-sub remove_downtime {
+sub remove_downtime_p {
     my $self = shift;
     my %objects = @_;
 
     if( exists $objects{name} and defined $objects{name} ) {
-        return $self->remove_downtimes( name => $objects{name} );
+        return $self->remove_downtimes_p( name => $objects{name} );
     }
-    return $self->remove_downtimes( objects => [ \%objects ] );
+    return $self->remove_downtimes_p( objects => [ \%objects ] );
 }
 
-sub remove_downtimes {
+sub remove_downtimes_p {
     my ($self, %args) = @_;
 
     if( defined $args{name} or defined $args{names} ) {
-        # uncoverable condition false
-        # uncoverable branch false
-        my $names = $args{name} // $args{names};
-        return $self->_i2req_pd('POST',
-            "/actions/remove-downtime",
-            {
-                type => 'Downtime',
-                filter => _filter_expr( 'downtime.__name', $names ),
-            }
+        return $self->_remove_downtime_type( 'Downtime',
+            { Downtime => _filter_expr( 'downtime.__name', $args{name} // $args{names} ) }
         );
     }
 
     ref $args{objects} eq 'ARRAY' or croak("`objects' arg must be an arrayref");
     my $filters = $self->_create_downtime_filters( $args{objects} );
     my @results;
-    for my $type ( grep { $filters->{$_} } qw/ Host Service / ) {
-        my $result = $self->_i2req_pd('POST',
-            '/actions/remove-downtime',
-            {
-                type => $type,
-                joins => [ "host.name" ],
-                filter => $filters->{$type},
-            }
-        );
-        push @results, @$result;
-    }
-    return \@results;
+    return Mojo::Promise->all(
+        map { $self->_remove_downtime_type( $_, $filters ) } qw/ Host Service /
+    )->then(
+        sub {
+            return [
+                map { @$_ } grep { defined } $_[0][0], $_[1][0]
+            ]
+        }
+    );
 }
 
+sub _remove_downtime_type {
+    my ($self, $type, $filters) = @_;
+    state $joins = {
+        Host => [ 'host.name' ],
+        Service => [ 'host.name', 'service.name' ],
+    };
+    return unless $filters->{$type};
+    return $self->_i2req_pd_p('POST',
+        '/actions/remove-downtime',
+        {
+            type => $type,
+            filter => $filters->{$type},
+            $joins->{$type} ? ( joins => $joins->{$type} ) : (),
+        }
+    );
+}
 
-sub send_custom_notification {
+sub send_custom_notification_p {
     my ($self, %args) = @_;
     _checkargs(\%args, qw/ comment /);
     _checkargs_any(\%args, qw/ host service /);
 
     my $obj_type = defined $args{host} ? 'host' : 'service';
 
-    return $self->_i2req_pd('POST',
+    return $self->_i2req_pd_p('POST',
         '/actions/send-custom-notification',
         {
             type => ucfirst $obj_type,
@@ -167,13 +165,13 @@ sub send_custom_notification {
     );
 }
 
-sub set_notifications {
+sub set_notifications_p {
     my ($self, %args) = @_;
     _checkargs(\%args, qw/ state /);
     _checkargs_any(\%args, qw/ host service /);
     my $uri_object = $args{service} ? 'services' : 'hosts';
 
-    return $self->_i2req_pd('POST',
+    return $self->_i2req_pd_p('POST',
         "/objects/$uri_object",
         {
             attrs => { enable_notifications => !!$args{state} },
@@ -182,134 +180,105 @@ sub set_notifications {
     );
 }
 
-sub query_app_attrs {
+sub query_app_attrs_p {
     my ($self) = @_;
 
-    my $r = $self->_i2req_pd('GET',
-        "/status/IcingaApplication",
+    return $self->_i2req_pd_p('GET', "/status/IcingaApplication",)->then(
+       sub { shift->[0]{status}{icingaapplication}{app} }
     );
-    # uncoverable branch true
-    # uncoverable condition left
-    # uncoverable condition right
-    ref $r eq 'ARRAY' and defined $r->[0] and defined $r->[0]{status}{icingaapplication}{app} or die "Invalid result from Icinga";
-
-    return $r->[0]{status}{icingaapplication}{app};
 }
 
-{
-    my %legal_attrs = map { $_ => 1 } qw/
-    event_handlers
-    flapping
-    host_checks
-    notifications
-    perfdata
-    service_checks
-    /;
+sub set_app_attrs_p {
+    my ($self, %args) = @_;
+    state $legal_attrs = {
+        map { $_ => 1 } qw/ event_handlers flapping host_checks
+        notifications perfdata service_checks /
+    };
 
-    sub set_app_attrs {
-        my ($self, %args) = @_;
-        _checkargs_any(\%args, keys %legal_attrs);
-        my @unknown_attrs = grep { not exists $legal_attrs{$_} } keys %args;
-        @unknown_attrs and croak(
-            sprintf "Unknown attributes: %s; legal attributes are: %s",
-            join(",", sort @unknown_attrs),
-            join(",", sort keys %legal_attrs),
-        );
+    _checkargs_any(\%args, keys %$legal_attrs);
+    my @unknown_attrs = grep { not exists $legal_attrs->{$_} } keys %args;
+    @unknown_attrs and croak(
+        sprintf "Unknown attributes: %s; legal attributes are: %s",
+        join(",", sort @unknown_attrs),
+        join(",", sort keys %$legal_attrs),
+    );
 
-        return $self->_i2req_pd('POST',
-            '/objects/icingaapplications/app',
-            {
-                attrs => {
-                    map { 'enable_' . $_ => !!$args{$_} } keys %args
-                },
-            }
-        );
-    }
+    return $self->_i2req_pd_p('POST',
+        '/objects/icingaapplications/app',
+        {
+            attrs => {
+                map { 'enable_' . $_ => !!$args{$_} } keys %args
+            },
+        }
+    );
 }
 
-sub set_global_notifications {
+sub set_global_notifications_p {
     my ($self, $state) = @_;
-    $self->set_app_attrs( notifications => $state );
+    $self->set_app_attrs_p( notifications => $state );
 }
 
-sub query_hosts {
+sub query_host_p {
+    my ($self, %args) = @_;
+    _checkargs(\%args, qw/ host /);
+    return $self->query_hosts_p( hosts => $args{host} )->then(
+        sub { shift->[0] }
+    );
+}
+
+sub query_hosts_p {
     my ($self, %args) = @_;
     _checkargs(\%args, qw/ hosts /);
-    return $self->_i2req_pd( 'GET', '/objects/hosts',
+    return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => _filter_expr( "host.name", $args{hosts} ) },
-        $args{callback},
     );
 }
 
-sub query_host {
+sub query_child_hosts_p {
     my ($self, %args) = @_;
     _checkargs(\%args, qw/ host /);
-    my @callback;
-    $args{callback} and @callback = ( callback => sub { $args{callback}->( shift->[0] ) } );
-    my $res = $self->query_hosts( hosts => $args{host}, @callback);
-    return $args{callback} ? $res : $res->[0];
-}
-
-sub query_child_hosts {
-    my ($self, %args) = @_;
-    _checkargs(\%args, qw/ host /);
-    return $self->_i2req_pd( 'GET', '/objects/hosts',
+    return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => "\"$args{host}\" in host.vars.parents" }
     );
 }
 
-sub query_parent_hosts {
+sub query_parent_hosts_p {
     my ($self, %args) = @_;
+    $args{hosts} //= delete $args{host};
     my $expand = delete $args{expand};
-    my $cb = delete $args{callback};
-    if( $cb ) {
-        # need to wrap callback for result unpacking/expansion
-        my $wrapped_cb = $expand ?
+    my $p = $self->query_hosts_p( %args )->then(
         sub {
-            my $parents = shift->{attrs}{vars}{parents};
-            return $cb->( [] ) unless $parents;
-            $self->query_hosts(
-                hosts => shift->{attrs}{vars}{parents},
-                callback => $cb,
-            );
-        } :
-        sub { $cb->( shift->{attrs}{vars}{parents} // [] ) };
-        return $self->query_host( %args, callback => $wrapped_cb );
-    }
-    # uncoverable condition right
-    my $results = $self->query_host( %args ) // {};
-    # uncoverable condition right
-    my $names = $results->{attrs}{vars}{parents} // [];
-    undef $results;
-    # uncoverable condition right
-    return $names unless $expand and @$names;
-    return $self->query_hosts( hosts => $names );
-}
-
-sub query_services {
-    my ($self, %args) = @_;
-    _checkargs_any(\%args, qw/ service services /);
-    my $srv = $args{service} // $args{services};
-    return $self->_i2req_pd('GET', '/objects/services',
-        { filter => _filter_expr( "service.name", $srv ) },
-        $args{callback},
+            my $r = shift->[0] // return [];
+            my $parents = $r->{attrs}{vars}{parents} // [];
+            return $parents unless $expand;
+            return $self->query_hosts_p( hosts => $parents );
+        }
     );
 }
 
-sub query_downtimes {
+sub query_services_p {
+    my ($self, %args) = @_;
+    _checkargs_any(\%args, qw/ service services /);
+    return $self->_i2req_pd_p('GET', '/objects/services',
+        { filter => _filter_expr( "service.name", $args{service} // $args{services} ) },
+    );
+}
+
+sub query_downtimes_p {
     my ($self, %args) = @_;
     my $filter = _dtquery2filter( %args );
-    return $self->_i2req_pd('GET', '/objects/downtimes',
+    return $self->_i2req_pd_p('GET', '/objects/downtimes',
         { $filter ? ( filter => $filter) : () }
     );
 }
 
-sub subscribe_events {
+# TODO: does _p make sense here?
+sub subscribe_events_p {
     my ($self, %args) = @_;
 
     require UUID;
     _checkargs(\%args, qw/ callback types /);
-    return $self->_start_i2req('POST', '/events',
+    return $self->_start_i2req_p('POST', '/events',
         [
             types => _validate_stream_types( $args{types} ),
             queue => $args{queue} // ( $self->author . '-' . uuid() ),
@@ -317,6 +286,23 @@ sub subscribe_events {
         undef,
         sub { $args{callback}->( decode_json(shift) ) },
     );
+}
+
+for my $method (qw/
+    schedule_downtime schedule_downtimes
+    remove_downtime remove_downtimes
+    send_custom_notification set_notifications query_app_attrs set_app_attrs
+    set_global_notifications
+    query_host query_hosts query_child_hosts query_parent_hosts
+    query_services query_downtimes
+    subscribe_events
+    /) {
+    quote_sub $method, qq{
+        my \$self=shift;
+        my \$result;
+        \$self->${method}_p( \@_ )->then( sub { \$result = shift } )->wait;
+        return \$result;
+    };
 }
 
 sub _validate_stream_types {
@@ -341,23 +327,22 @@ sub _validate_stream_types {
     return $types;
 }
 
-# Send an Icinga2 request with postdata and return the results or transaction if async
-sub _i2req_pd {
-    my ($self, $method, $path, $postdata, $cb) = @_;
-
-    $cb and return $self->i2req( $method, $path, undef, $postdata, sub { $cb->( _results_cb( shift ) ) } );
-    return _results_cb( $self->i2req( $method, $path, undef, $postdata ) );
-}
-
-sub _results_cb {
-    shift->{results} // croak( "Missing `results' field in Icinga response" );
+# Send an Icinga2 request with postdata and return a promise on the result
+sub _i2req_pd_p {
+    my ($self, $method, $path, $postdata) = @_;
+    return $self->i2req_p( $method, $path, undef, $postdata )->then(
+        sub { shift->{results} // croak( "Missing `results' field in Icinga response" ) }
+    );
 }
 
 sub _urlobj {
-    my ($self) = @_;
+    my ($self, $path, $params) = @_;
 
     my $u = Mojo::URL->new( $self->url );
     $u->path->merge( 'v' . $self->api_version . '/' );
+    $path =~ s!^/!!;
+    $u->path->merge( $path );
+    $u->query->merge( @$params ) if defined $params;
     return $u;
 }
 
