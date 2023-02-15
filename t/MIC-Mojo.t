@@ -6,8 +6,7 @@ use utf8;
 use open qw/ :encoding(UTF-8) :std /;
 use Test2::Bundle::More;
 use Test2::Tools::Subtest qw/subtest_buffered/;
-use Test::Builder;
-use Test::Fatal;
+use Test2::Tools::Exception;
 use JSON::XS;
 use Monitoring::Icinga2::Client::Mojo;
 BEGIN { Monitoring::Icinga2::Client::Mojo::Tester->import }
@@ -42,44 +41,25 @@ my $uri_status   = "$uri_base/status/IcingaApplication";
 my $fil_host     = '"filter":"(host.name==\"localhost\")"';
 my $fil_hostsrv  = '"filter":"((host.name==\"localhost\")&&(service.name==\"myservice\"))"';
 
-sub test_schedule_downtime {
-    my ( $host, $filter, $text ) = @_;
-    my ( $req_dthost, $req_dtservs, $req_dtserv ) = _downtime_query( $filter );
-    (my $req_dthostu = $req_dthost) =~ s/admin/$LOGIN/;
+isa_ok( newob(), 'Monitoring::Icinga2::Client::Mojo' );
 
-    req_ok(
-        'schedule_downtime',
-        [ host => $host, @START_END, comment => 'no comment', author => 'admin', ],
-        [ $uri_scheddt => $req_dthost ],
-        "schedule_downtime, $text"
-    );
+req_fail(
+    'schedule_downtime',
+    [ host => 'localhost' ],
+    qr/^missing or undefined argument `start_time'/,
+    "detects missing args"
+);
 
-    req_ok(
-        'schedule_downtime',
-        [ host => $host, @START_END, comment => 'no comment', author => 'admin', services => 1 ],
-        [
-            $uri_scheddt => $req_dthost,
-            $uri_scheddt => $req_dtservs,
-        ],
-        "schedule_downtime w/services, $text"
-    );
+subtest schedule_downtime_single => sub {
+    test_schedule_downtime( 'localhost', '(host.name==\"localhost\")', "single host" );
+};
 
-    req_ok(
-        'schedule_downtime',
-        [ host => $host, @START_END, comment => 'no comment', author => 'admin', service => 'myservice' ],
-        [ $uri_scheddt => $req_dtserv ],
-        "schedule_downtime w/single service, $text"
-    );
+subtest schedule_downtime_multi => sub {
+    test_schedule_downtime( [ 'localhost', 'otherhost' ], '(host.name in [\"localhost\",\"otherhost\"])', "multiple hosts" );
+};
 
-    req_ok(
-        'schedule_downtime',
-        [ host => $host, @START_END, comment => 'no comment' ],
-        [ $uri_scheddt => $req_dthostu ],
-        "schedule_downtime w/o explicit author, $text"
-    );
-}
 
-sub test_schedule_downtimes {
+subtest test_schedule_downtimes => sub {
     my ( $req_dthost ) = _downtime_query( 'match(\"db*\",host.name)||regex(\"web-[0-3]\",host.name)' );
     my ( undef, $req_dtservs ) = _downtime_query(
         '((host.name in [\"h3\",\"h4\"])&&(service.name==\"s3\"))||' .
@@ -132,10 +112,9 @@ sub test_schedule_downtimes {
         qr/^neither host nor service definition found in filter/,
         "catches empty filter expressions"
     );
-}
+};
 
-
-sub test_remove_downtime {
+subtest test_remove_downtime => sub {
     req_fail(
         'remove_downtimes',
         [ objects => "foo", ],
@@ -178,9 +157,9 @@ sub test_remove_downtime {
         [ $uri_removedt => '{"filter":"downtime.__name==\"foobar\"","type":"Downtime"}' ],
         "remove_downtimes by names (synonymous to name)"
     );
-}
+};
 
-sub test_query_downtimes {
+subtest query_downtimes => sub {
     my %lt_gt_eq = ( _lt => '<', _gt => '>', '' => '==' );
     my @tests = (
         [ ] => '{}',
@@ -215,22 +194,7 @@ sub test_query_downtimes {
             "query downtime by " . join('/', keys %args),
         );
     }
-}
-
-sub test_downtimes {
-    req_fail(
-        'schedule_downtime',
-        [ host => 'localhost' ],
-        qr/^missing or undefined argument `start_time'/,
-        "detects missing args"
-    );
-
-    test_schedule_downtime( 'localhost', '(host.name==\"localhost\")', "single host" );
-    test_schedule_downtime( [ 'localhost', 'otherhost' ], '(host.name in [\"localhost\",\"otherhost\"])', "multiple hosts" );
-    test_schedule_downtimes();
-    test_remove_downtime();
-    test_query_downtimes();
-}
+};
 
 # Need more sophisticated Mojo::UserAgent::start spoofing for this to actually work
 #sub test_async_sync {
@@ -251,58 +215,58 @@ sub test_downtimes {
 #    use YAML::XS; say STDERR "ASYNC: ",Dump($r2);
 #}
 
-isa_ok( newob(), 'Monitoring::Icinga2::Client::Mojo', "new" );
+subtest send_custom_notification => sub {
+    req_ok(
+        'send_custom_notification',
+        [ comment => 'mycomment', author => 'admin', host => 'localhost' ],
+        [ $uri_custnot => '{"author":"admin","comment":"mycomment","filter":"host.name==\"localhost\"","type":"Host"}' ],
+        "send custom notification for host"
+    );
 
-test_downtimes();
+    req_ok(
+        'send_custom_notification',
+        [ comment => 'mycomment', author => 'admin', service => 'myservice' ],
+        [ $uri_custnot => '{"author":"admin","comment":"mycomment","filter":"service.name==\"myservice\"","type":"Service"}' ],
+        "send custom notification for service"
+    );
 
-req_ok(
-    'send_custom_notification',
-    [ comment => 'mycomment', author => 'admin', host => 'localhost' ],
-    [ $uri_custnot => '{"author":"admin","comment":"mycomment","filter":"host.name==\"localhost\"","type":"Host"}' ],
-    "send custom notification for host"
-);
+    req_ok(
+        'send_custom_notification',
+        [ comment => 'mycomment', service => 'myservice' ],
+        [ $uri_custnot => '{"author":"' . $LOGIN . '","comment":"mycomment","filter":"service.name==\"myservice\"","type":"Service"}', ],
+        "send custom notification w/o explicit author"
+    );
+};
 
-req_ok(
-    'send_custom_notification',
-    [ comment => 'mycomment', author => 'admin', service => 'myservice' ],
-    [ $uri_custnot => '{"author":"admin","comment":"mycomment","filter":"service.name==\"myservice\"","type":"Service"}' ],
-    "send custom notification for service"
-);
+subtest set_notifications => sub {
+    req_ok(
+        'set_notifications',
+        [ state => 1, host => 'localhost' ],
+        [ $uri_hosts => '{"attrs":{"enable_notifications":1},"filter":"host.name==\"localhost\""}' ],
+        "enable notifications for host"
+    );
 
-req_ok(
-    'send_custom_notification',
-    [ comment => 'mycomment', service => 'myservice' ],
-    [ $uri_custnot => '{"author":"' . $LOGIN . '","comment":"mycomment","filter":"service.name==\"myservice\"","type":"Service"}', ],
-    "send custom notification w/o explicit author"
-);
+    req_ok(
+        'set_notifications',
+        [ state => 0, host => 'localhost', service => 'myservice' ],
+        [ $uri_services => '{"attrs":{"enable_notifications":""},'. $fil_hostsrv .'}' ],
+        "disable notifications for service"
+    );
 
-req_ok(
-    'set_notifications',
-    [ state => 1, host => 'localhost' ],
-    [ $uri_hosts => '{"attrs":{"enable_notifications":1},"filter":"host.name==\"localhost\""}' ],
-    "enable notifications for host"
-);
+    req_fail(
+        'set_notifications',
+        [ state => 1, service => 'myservice' ],
+        qr/^missing or undefined argument `host' to Monitoring::Icinga2::Client::Mojo::set_notifications()/,
+        "catches missing host argument"
+    );
 
-req_ok(
-    'set_notifications',
-    [ state => 0, host => 'localhost', service => 'myservice' ],
-    [ $uri_services => '{"attrs":{"enable_notifications":""},'. $fil_hostsrv .'}' ],
-    "disable notifications for service"
-);
-
-req_fail(
-    'set_notifications',
-    [ state => 1, service => 'myservice' ],
-    qr/^missing or undefined argument `host' to Monitoring::Icinga2::Client::Mojo::set_notifications()/,
-    "catches missing host argument"
-);
-
-req_fail(
-    'set_notifications',
-    [ ],
-    qr/^missing or undefined argument `state'/,
-    "catches missing state"
-);
+    req_fail(
+        'set_notifications',
+        [ ],
+        qr/^missing or undefined argument `state'/,
+        "catches missing state"
+    );
+};
 
 req_ok(
     'query_app_attrs',
@@ -311,26 +275,28 @@ req_ok(
     "query application attributes"
 );
 
-req_ok(
-    'set_app_attrs',
-    [ flapping => 1, notifications => 0, perfdata => 1 ],
-    [ $uri_app => '{"attrs":{"enable_flapping":1,"enable_notifications":"","enable_perfdata":1}}' ],
-    "set application attributes"
-);
+subtest set_app_attrs => sub {
+    req_ok(
+        'set_app_attrs',
+        [ flapping => 1, notifications => 0, perfdata => 1 ],
+        [ $uri_app => '{"attrs":{"enable_flapping":1,"enable_notifications":"","enable_perfdata":1}}' ],
+        "set application attributes"
+    );
 
-req_fail(
-    'set_app_attrs',
-    [ foo => 1 ],
-    qr/^need at least one argument of/,
-    "detects missing valid args"
-);
+    req_fail(
+        'set_app_attrs',
+        [ foo => 1 ],
+        qr/^need at least one argument of/,
+        "detects missing valid args"
+    );
 
-req_fail(
-    'set_app_attrs',
-    [ foo => 1, notifications => 0, bar => 'qux' ],
-    qr/^Unknown attributes: bar,foo; legal attributes are: event_handlers,/,
-    "detects invalid arg"
-);
+    req_fail(
+        'set_app_attrs',
+        [ foo => 1, notifications => 0, bar => 'qux' ],
+        qr/^Unknown attributes: bar,foo; legal attributes are: event_handlers,/,
+        "detects invalid arg"
+    );
+};
 
 req_ok(
     'set_global_notifications',
@@ -367,7 +333,8 @@ req_ok(
     "query parent hosts"
 );
 
-## TODO: find out why this fails. Works fine without mockups.
+## TODO: find out why this only makes one request.
+## Works fine without mockups.
 #req_ok(
 #    'query_parent_hosts',
 #    [ host => 'localhost', expand => 1 ],
@@ -378,27 +345,64 @@ req_ok(
 #    "query parent hosts with expansion"
 #);
 
-req_ok(
-    'query_services',
-    [ service => 'myservice' ],
-    [ $uri_services => '{"filter":"service.name==\"myservice\""}' ],
-    "query service"
-);
+subtest query_services => sub {
+    req_ok(
+        'query_services',
+        [ service => 'myservice' ],
+        [ $uri_services => '{"filter":"service.name==\"myservice\""}' ],
+        "query service"
+    );
 
-req_ok(
-    'query_services',
-    [ services => [ qw/ myservice otherservice / ] ],
-    [ $uri_services => '{"filter":"service.name in [\"myservice\",\"otherservice\"]"}' ],
-    "query services (synonymous arg)"
-);
+    req_ok(
+        'query_services',
+        [ services => [ qw/ myservice otherservice / ] ],
+        [ $uri_services => '{"filter":"service.name in [\"myservice\",\"otherservice\"]"}' ],
+        "query services (synonymous arg)"
+    );
+};
 
 # Check that _mic_author is always set
 is( newob()->author, $LOGIN, "author set with useragent" );
 is( Monitoring::Icinga2::Client::Mojo->new( url => 'localhost' )->author, $LOGIN, "author set w/o useragent" );
 
-#test_async_sync();
-
 done_testing;
+
+sub test_schedule_downtime {
+    my ( $host, $filter, $text ) = @_;
+    my ( $req_dthost, $req_dtservs, $req_dtserv ) = _downtime_query( $filter );
+    (my $req_dthostu = $req_dthost) =~ s/admin/$LOGIN/;
+
+    req_ok(
+        'schedule_downtime',
+        [ host => $host, @START_END, comment => 'no comment', author => 'admin', ],
+        [ $uri_scheddt => $req_dthost ],
+        "schedule_downtime, $text"
+    );
+
+    req_ok(
+        'schedule_downtime',
+        [ host => $host, @START_END, comment => 'no comment', author => 'admin', services => 1 ],
+        [
+            $uri_scheddt => $req_dthost,
+            $uri_scheddt => $req_dtservs,
+        ],
+        "schedule_downtime w/services, $text"
+    );
+
+    req_ok(
+        'schedule_downtime',
+        [ host => $host, @START_END, comment => 'no comment', author => 'admin', service => 'myservice' ],
+        [ $uri_scheddt => $req_dtserv ],
+        "schedule_downtime w/single service, $text"
+    );
+
+    req_ok(
+        'schedule_downtime',
+        [ host => $host, @START_END, comment => 'no comment' ],
+        [ $uri_scheddt => $req_dthostu ],
+        "schedule_downtime w/o explicit author, $text"
+    );
+}
 
 # Check that a request succeeds and has both the right URI and the
 # correct postdata.
@@ -410,9 +414,8 @@ done_testing;
 sub req_ok {
     my ($method, $margs, $req_cont, $desc) = @_;
     my $c = newob();
-    is(
-        exception { $c->$method( @$margs ) },
-        undef,
+    ok(
+        lives { $c->$method( @$margs ) },
         "$desc: arg check passes for $method",
     ) and _checkreq( $c, $req_cont, $desc );
 }
@@ -423,7 +426,7 @@ sub req_fail {
     my ($method, $margs, $except_re, $desc) = @_;
     my $c = newob();
     like(
-        exception { $c->$method( @$margs ) },
+        dies { $c->$method( @$margs ) },
         $except_re,
         "$method fails: $desc",
     );
@@ -455,7 +458,7 @@ sub _checkreq {
 
 # Construct a new object with the subclassed user agent that collects call stats
 sub newob {
-    return Monitoring::Icinga2::Client::Mojo::Tester->new->url('https://localhost:5665/');
+    return Monitoring::Icinga2::Client::Mojo::Tester->new->url('https://localhost:5665/')->retries(0);
 }
 
 # Canonicalize a JSON string by decoding and subsequent encoding

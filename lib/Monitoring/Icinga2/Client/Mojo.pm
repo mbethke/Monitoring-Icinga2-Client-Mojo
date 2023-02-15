@@ -1,26 +1,120 @@
+# ABSTRACT: Synchronous/asynchronous REST client for Icinga2
+
 package Monitoring::Icinga2::Client::Mojo;
 
+use v5.24;
 use strictures 2;
-use Mojo::Base 'Mojo::UserAgent';
+use Mojo::Base 'Mojo::EventEmitter';
 use Carp;
 use Mojo::UserAgent;
 use Mojo::Promise;
-use JSON;
-use YAML::XS;   # TODO remove
-use Data::Dumper;   # TODO remove
+use Try::Tiny;
+use JSON::MaybeXS qw/ decode_json /;
+use Scalar::Util qw/ blessed /;
 use List::Util qw/ all any first /;
 use Sub::Quote qw/ quote_sub /;
-use constant DEBUG => $ENV{DEBUG};
-our $VERSION = "v0.0.1";    # TODO
+use Monitoring::Icinga2::Client::Mojo::Downtime;
+use Monitoring::Icinga2::Client::Mojo::Result;
+use Monitoring::Icinga2::Client::Mojo::Transaction;
+use namespace::clean;
 
-has 'url';
+our $EVENT_STREAM_TYPES = {
+    AcknowledgementSet => [ qw/ host timestamp / ],
+    AcknowledgementCleared => [ qw/ host timestamp / ],
+    CheckResult => {
+        host => 'shift->{host}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        check_source => 'shift->{check_result}{check_source}',
+        state => 'shift->{check_result}{state}',
+        check_source => 'shift->{check_result}{check_source}',
+    },
+    CommentAdded => [ qw/ host timestamp / ],
+    CommentRemoved => [ qw/ host timestamp / ],
+    DowntimeAdded => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        end_time => 'shift->{downtime}{end_time}',
+        fixed => '!!shift->{downtime}{fixed}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        start_time => 'shift->{downtime}{start_time}',
+        timestamp => 'shift->{timestamp}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+        version => 'shift->{downtime}{version}',
+        was_cancelled => '!!shift->{downtime}{was_cancelled}',
+        zone => 'shift->{downtime}{zone}',
+    },
+    DowntimeRemoved => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        end_time => 'shift->{downtime}{end_time}',
+        fixed => '!!shift->{downtime}{fixed}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        start_time => 'shift->{downtime}{start_time}',
+        timestamp => 'shift->{timestamp}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+        version => 'shift->{downtime}{version}',
+        was_cancelled => '!!shift->{downtime}{was_cancelled}',
+        zone => 'shift->{downtime}{zone}',
+    },
+    DowntimeStarted => {
+        host => 'shift->{host}',
+        author => 'shift->{author}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        text => 'shift->{text}',
+        users => '[ @{ shift->{users} // [] } ]',
+    },
+    DowntimeTriggered => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        timestamp => 'shift->{timestamp}',
+        triggered_by => 'shift->{downtime}{triggered_by}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+    },
+    Generic => [],
+    Notification => {
+        author => 'shift->{author}',
+        host => 'shift->{host}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        notification_type => 'shift->{notification_type}',
+        text => 'shift->{text}',
+        users => '[ @{ shift->{users} // [] } ]',
+    },
+    StateChange => [qw/ host service state state_type timestamp /],
+};
+
+has [qw/ ua url /];
+has retries => sub { 0 };
+has retry_delay => sub { 5 };
 has api_version => sub { 1 };
 has author => sub { getlogin || getpwuid($<) };
+has icinga_events => sub { {} };
 
 sub new {
     my $class = shift;
-    my $self = $class->SUPER::new( max_response_size => 0, @_ );
-    $self->transactor->name( __PACKAGE__ . ' ' . $VERSION );
+    my %args = @_ % 2 ? $_[0]->%* : @_;
+    my $self = $class->SUPER::new(
+        map { exists $args{$_} ? ( $_ => delete $args{$_} ) : () }
+        qw/ ua url retries retry_delay api_version author /
+    );
+    my $ua = Mojo::UserAgent->new( max_response_size => 0 , %args )->insecure( !!delete $args{insecure} );
+    $ua->transactor->name( __PACKAGE__ . ' ' . ( $Monitoring::Icinga2::Client::Mojo::VERSION // 'devel' ) );
+    $self->ua( $ua );
     return $self;
 }
 
@@ -31,28 +125,11 @@ sub i2req_p {
     );
 }
 
-sub i2req {
-    my $self = shift;
-    my @result;
-    $self->i2req_p( @_ )->then( sub { @result = @_ } )->wait;
-    return @result;
-}
-
-sub _start_i2req_p {
-    my ( $self, $method, $path, $params, $data, $streaming_cb ) = @_;
-
-    my $tx = $self->build_tx(
-        $method,
-        $self->_urlobj( $path, $params ),
-        { Accept => 'application/json' },
-        ( $data ? (json => $data) : () )
+sub query_p {
+    my ($self, $path, $filter) = @_;
+    return $self->_start_i2req_p( 'GET', $path, undef, [ $filter ] )->then(
+        sub { decode_json( shift->result->body ) },
     );
-    if( defined $streaming_cb ) {
-        $tx->res->content->unsubscribe( 'read' )->on(
-            read => _callback_by_line( $streaming_cb ),
-        );
-    }
-    return $self->start_p( $tx );
 }
 
 sub schedule_downtime_p {
@@ -74,10 +151,12 @@ sub schedule_downtimes_p {
         map { $self->_schedule_downtime_type( $_, $filters, \%args ) } qw/ Host Service /
     )->then(
         sub {
+            my @results = @_;
             return [
-                map { @$_ } grep { defined } $_[0][0], $_[1][0]
+                map { Monitoring::Icinga2::Client::Mojo::Downtime->new( $_ ) }
+                map { @$_ } grep { defined } map { $results[$_][0] } $#results
             ]
-        }
+        },
     );
 }
 
@@ -95,37 +174,49 @@ sub _schedule_downtime_type {
     );
 }
 
-sub remove_downtime_p {
-    my $self = shift;
-    my %objects = @_;
-
-    if( exists $objects{name} and defined $objects{name} ) {
-        return $self->remove_downtimes_p( name => $objects{name} );
-    }
-    return $self->remove_downtimes_p( objects => [ \%objects ] );
-}
-
 sub remove_downtimes_p {
     my ($self, %args) = @_;
+    my $p;
 
-    if( defined $args{name} or defined $args{names} ) {
-        return $self->_remove_downtime_type( 'Downtime',
+    if( defined $args{downtime} ) {
+        my $filter;
+        if( 'ARRAY' eq ref $args{downtime} ) {
+            $filter = _filter_expr( 'downtime.__name', [ map { $_->name } @{ $args{downtime} } ] );
+        } elsif(
+            blessed($args{downtime})
+                and $args{downtime}->isa( 'Monitoring::Icinga2::Client::Mojo::Downtime' ) ) {
+            $filter = _filter_expr( 'downtime.__name', $args{downtime}->name );
+        } else {
+            croak( "downtime arg must be arrayref or Monitoring::Icinga2::Client::Mojo::Downtime object" );
+        }
+        $p = $self->_remove_downtime_type( 'Downtime', $filter );
+    } elsif( defined $args{name} or defined $args{names} ) {
+        $p = $self->_remove_downtime_type( 'Downtime',
             { Downtime => _filter_expr( 'downtime.__name', $args{name} // $args{names} ) }
+        );
+    } else {
+        ref $args{objects} eq 'ARRAY'
+            or croak("`objects' arg must be an arrayref");
+        my $filters = $self->_create_downtime_filters( $args{objects} );
+        my @results;
+        $p = Mojo::Promise->all(
+            map { $self->_remove_downtime_type( $_, $filters ) } qw/ Host Service /
         );
     }
 
-    ref $args{objects} eq 'ARRAY' or croak("`objects' arg must be an arrayref");
-    my $filters = $self->_create_downtime_filters( $args{objects} );
-    my @results;
-    return Mojo::Promise->all(
-        map { $self->_remove_downtime_type( $_, $filters ) } qw/ Host Service /
-    )->then(
-        sub {
-            return [
-                map { @$_ } grep { defined } $_[0][0], $_[1][0]
-            ]
-        }
-    );
+    state $resolve = _make_resolve_cb( 'Result' );
+    return $p->then( $resolve );
+}
+
+sub _make_resolve_cb {
+    my ($resultclass) = @_;
+    return sub {
+        return [
+            map {
+                "Monitoring::Icinga2::Client::Mojo::$resultclass"->new( map { 'ARRAY' eq ref ? @$_ : $_ } @$_ )
+            } @_
+        ];
+    };
 }
 
 sub _remove_downtime_type {
@@ -258,9 +349,9 @@ sub query_parent_hosts_p {
 
 sub query_services_p {
     my ($self, %args) = @_;
-    _checkargs_any(\%args, qw/ service services /);
+    _checkargs(\%args, qw/ services /);
     return $self->_i2req_pd_p('GET', '/objects/services',
-        { filter => _filter_expr( "service.name", $args{service} // $args{services} ) },
+        { filter => _filter_expr( "service.name", $args{services} ) },
     );
 }
 
@@ -272,46 +363,180 @@ sub query_downtimes_p {
     );
 }
 
-# TODO: does _p make sense here?
-sub subscribe_events_p {
-    my ($self, %args) = @_;
+sub on {
+    my ($self, $ev, $cb) = @_;
+    my $ie = $self->icinga_events;
 
-    require UUID;
-    _checkargs(\%args, qw/ callback types /);
-    return $self->_start_i2req_p('POST', '/events',
-        [
-            types => _validate_stream_types( $args{types} ),
-            queue => $args{queue} // ( $self->author . '-' . uuid() ),
-        ],
-        undef,
-        sub { $args{callback}->( decode_json(shift) ) },
+    my ($event, $filter) = split /:/, $ev, 2;
+    my $filter_key = $filter // '';
+    if( exists $EVENT_STREAM_TYPES->{$event} ) {
+        if( $ie->{$filter_key}{$event} ) {
+            $ie->{$filter_key}{$event}++;
+        } else {
+            $ie->{$filter_key}{$event}++;
+            $self->_try_resubscribe_all( $ie->{$filter_key}, $filter );
+        }
+    }
+    return $self->SUPER::on( $ev, $cb );
+}
+
+sub unsubscribe {
+    my ($self, $ev, $cb) = @_;
+    my $ie = $self->{icinga_events};
+
+    my ($event, $filter) = split /:/, $ev, 2;
+    my $filter_key = $filter // '';
+
+    if( exists $EVENT_STREAM_TYPES->{$event} ) {
+        if( 0 == --$ie->{$filter_key}{$event} ) {
+            delete $ie->{$filter_key}{$event};
+            $self->_try_resubscribe_all( $ie->{$filter_key}, $filter )
+                or delete $ie->{$filter_key};
+        }
+    }
+    return $self->SUPER::unsubscribe( $ev, $cb );
+}
+
+# Try to resubscribe to all events named as keys in %$ev and return a started transaction.
+# If there are none, close the running transaction, delete the meta keys and return false.
+sub _try_resubscribe_all {
+    my ($self, $ev, $filter) = @_;
+
+    my @events = grep { substr( $_, 0, 1 ) ne '_' } keys %$ev;
+    if( @events ) {
+        return $ev->{_running} = $self->_subscribe(
+            \@events,
+            $filter,
+            $ev->{_queue} //= $self->_new_queue
+        );
+    }
+    $ev->{_running}->closed if $ev->{_running};
+    delete $ev->{_running};
+    delete $ev->{_queue};
+    return;
+}
+
+# Subscribe to a number of events sharing a filter expression
+sub _subscribe {
+    my ($self, $type, $filter, $queue) = @_;
+    my @filter = defined $filter ? ( filter => $filter ) : ();
+
+    weaken($self);
+    my $tx = Monitoring::Icinga2::Client::Mojo::Transaction->new(
+        $self->ua->build_tx(
+            'POST',
+            $self->_urlobj( '/events' ),
+            { Accept => 'application/json' },
+            json => {
+                types => [ grep { substr($_,0,1) ne '_' } @$type ],
+                @filter,
+                queue => $queue,
+            }
+        ),
+        $self->retries,
     );
+    $tx->res->content->unsubscribe( 'read' )->on(
+        read => _callback_by_line(
+            sub {
+                my $msg = decode_json(shift);
+                $self->emit( $msg->{type} . (defined $filter ? ":$filter" : ""), _event_to_object( $msg ) );
+            }
+        )
+    );
+    $self->_start_retrying_p( $tx );
+    return $tx;
+}
+
+# Create a new queue ID from author and UUID
+sub _new_queue {
+    my ($self) = @_;
+    require UUID::Tiny;
+    $self->author . '-' . UUID::Tiny::create_uuid_as_string(UUID::Tiny::UUID_V1());
+}
+
+sub _start_i2req_p {
+    my ( $self, $method, $path, $params, $data, $streaming_cb ) = @_;
+    my $tx = Monitoring::Icinga2::Client::Mojo::Transaction->new(
+        $self->ua->build_tx(
+            $method,
+            $self->_urlobj( $path, $params ),
+            { Accept => 'application/json' },
+            @$data,
+        ),
+        $self->retries,
+    );
+    if( defined $streaming_cb ) {
+        $tx->res->content->unsubscribe( 'read' )->on(
+            read => _callback_by_line( $streaming_cb ),
+        );
+    }
+    return $self->_start_retrying_p( $tx );
+}
+
+sub _start_retrying_p {
+    my ($self, $tx, $promise) = @_;
+    $promise //= Mojo::Promise->new;
+
+    $self->ua->start_p( $tx )->then(
+        sub { $promise->resolve( @_ ) },
+        sub {
+	        my $err = shift;
+            my $retries_left = $tx->i2_retries or do {
+                my $retries = $self->retries;
+                $promise->reject(
+                    $retries ? "$err (retried $retries times)" : $err
+                );
+                return;
+            };
+            $tx->i2_retries( $retries_left - 1 );
+            weaken($tx);
+            weaken($promise);
+            weaken($self);
+            Mojo::IOLoop->timer(
+                $self->retry_delay => sub {
+                    $self->_start_retrying_p( $tx, $promise )
+                }
+            );
+        }
+    );
+    return $promise;
+}
+
+sub _event_to_object {
+    my ($res) = @_;
+    my $type = $res->{type};
+    $type = 'Generic' unless exists $EVENT_STREAM_TYPES->{$type};
+    return "Monitoring::Icinga2::Client::Mojo::Event::$type"->new( $res );
 }
 
 for my $method (qw/
-    schedule_downtime schedule_downtimes
-    remove_downtime remove_downtimes
-    send_custom_notification set_notifications query_app_attrs set_app_attrs
-    set_global_notifications
-    query_host query_hosts query_child_hosts query_parent_hosts
-    query_services query_downtimes
+    i2req query
+    schedule_downtime schedule_downtimes remove_downtimes
+    send_custom_notification set_notifications
+    query_app_attrs set_app_attrs set_global_notifications
+    query_hosts query_child_hosts query_parent_hosts
+    query_services
+    query_downtimes
     subscribe_events
     /) {
-    quote_sub $method, qq{
-        my \$self=shift;
-        my \$result;
-        \$self->${method}_p( \@_ )->then( sub { \$result = shift } )->wait;
-        return \$result;
-    };
+    quote_sub($method, sprintf(q{
+            my $self=shift;
+            my ($result, $error);
+            $self->%s_p( @_ )->then(
+                sub { $result = shift },
+                sub { $error = shift }
+            )->wait;
+            die $error if defined $error;
+            return $result;
+            } , $method
+        )
+    );
 }
 
 sub _validate_stream_types {
     my ($types) = @_;
-    state $EVENT_STREAM_TYPES = {
-        map { $_ => 1 } qw/ CheckResult StateChange Notification
-        AcknowledgementSet AcknowledgementCleared CommentAdded CommentRemoved
-        DowntimeAdded DowntimeRemoved DowntimeStarted DowntimeTriggered /
-    };
+    our $EVENT_STREAM_TYPES;
+
     for( ref $types ) {
         $_ eq '' and $types = [ $types ], last;
         $_ eq 'ARRAY' and last;
@@ -330,18 +555,18 @@ sub _validate_stream_types {
 # Send an Icinga2 request with postdata and return a promise on the result
 sub _i2req_pd_p {
     my ($self, $method, $path, $postdata) = @_;
-    return $self->i2req_p( $method, $path, undef, $postdata )->then(
+    return $self->i2req_p( $method, $path, undef, [ json => $postdata ] )->then(
         sub { shift->{results} // croak( "Missing `results' field in Icinga response" ) }
     );
 }
 
+# Construct a Mojo::URL object using the $path fragment and GET $params
 sub _urlobj {
     my ($self, $path, $params) = @_;
 
     my $u = Mojo::URL->new( $self->url );
-    $u->path->merge( 'v' . $self->api_version . '/' );
-    $path =~ s!^/!!;
-    $u->path->merge( $path );
+    $path = "/$path" unless substr( $path, 0, 1) eq '/';
+    $u->path->merge( 'v' . $self->api_version . $path );
     $u->query->merge( @$params ) if defined $params;
     return $u;
 }
@@ -474,7 +699,7 @@ sub _filter_expr {
     return "$type==\"$arg\"" unless ref $arg;
     return "$type in [" . join( ',', map { "\"$_\"" } @$arg ) . ']';
 }
-#
+
 # From a callback coderef, create a new one that can be called with arbitrary
 # chunks of text and will pass it on line by line to the original one.
 sub _callback_by_line {
@@ -484,10 +709,28 @@ sub _callback_by_line {
         my $bytes = $_[1] // return;
         $acc .= $bytes;
         return unless $acc =~ /\n/;
+        # split into arbitrarily many fields while preserving trailing empty ones
         my @lines = split /^/, $acc, -1;
         $acc = pop @lines;
         $cb->( $_ ) for @lines;
     };
+}
+
+# Create Monitoring::Icinga2::Client::Mojo::Event subclasses for each
+# event stream type
+while( my ($subclass, $desc) = each %$EVENT_STREAM_TYPES ) {
+    my $class = "Monitoring::Icinga2::Client::Mojo::Event::$subclass";
+    ref $desc eq 'ARRAY'
+        and $desc = { map { $_ => "shift->{$_}" } @$desc };
+
+    quote_sub( "${class}::new" => q{
+        my ($class, $pkt) = @_;
+        return bless $pkt, $class;
+        }
+    );
+    while( my ($method, $code) = each %$desc ) {
+        quote_sub( "${class}::$method" => $code );
+    }
 }
 
 1;
