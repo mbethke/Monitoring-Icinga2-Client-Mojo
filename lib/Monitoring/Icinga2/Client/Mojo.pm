@@ -16,6 +16,8 @@ use Sub::Quote qw/ quote_sub /;
 use Monitoring::Icinga2::Client::Mojo::Downtime;
 use Monitoring::Icinga2::Client::Mojo::Result;
 use Monitoring::Icinga2::Client::Mojo::Transaction;
+use feature qw/ signatures /;
+no warnings qw/ experimental::signatures /;
 use namespace::clean;
 
 our $EVENT_STREAM_TYPES = {
@@ -101,50 +103,42 @@ our $EVENT_STREAM_TYPES = {
 has [qw/ ua url /];
 has retries => sub { 0 };
 has retry_delay => sub { 5 };
-has api_version => sub { 1 };
 has author => sub { getlogin || getpwuid($<) };
-has icinga_events => sub { {} };
+has _icinga_events => sub { {} };
 
 sub new {
     my $class = shift;
     my %args = @_ % 2 ? $_[0]->%* : @_;
-    my $self = $class->SUPER::new(
-        map { exists $args{$_} ? ( $_ => delete $args{$_} ) : () }
-        qw/ ua url retries retry_delay api_version author /
-    );
-    my $ua = Mojo::UserAgent->new( max_response_size => 0 , %args )->insecure( !!delete $args{insecure} );
-    $ua->transactor->name( __PACKAGE__ . ' ' . ( $Monitoring::Icinga2::Client::Mojo::VERSION // 'devel' ) );
-    $self->ua( $ua );
+    my $ua = delete $args{ua};
+    my %self_args = delete %args{grep { exists $args{$_} } qw/ url retries retry_delay author /};
+    unless( $ua ) {
+        $ua = Mojo::UserAgent->new( max_response_size => 0 , %args );
+        $ua->insecure( !!delete $args{insecure} );
+        $ua->transactor->name(
+            __PACKAGE__ . ' ' . ( $Monitoring::Icinga2::Client::Mojo::VERSION // 'devel' )
+        );
+    }
+    my $self = $class->SUPER::new( %self_args, ua => $ua );
     return $self;
 }
 
-sub i2req_p {
+sub i2req_p() {
     my $self = shift;
     return $self->_start_i2req_p( @_ )->then(
         sub { decode_json( shift->result->body ) },
     );
 }
 
-sub query_p {
-    my ($self, $path, $filter) = @_;
+sub query_p($self, $path, $filter) {
     return $self->_start_i2req_p( 'GET', $path, undef, [ $filter ] )->then(
         sub { decode_json( shift->result->body ) },
     );
 }
 
-sub schedule_downtime_p {
-    my $self = shift;
-    my %objects = @_;
-    delete @objects{qw/ start_time end_time comment author duration fixed /};
-    return $self->schedule_downtimes_p( @_, objects => [ \%objects ] );
-}
-
-sub schedule_downtimes_p {
-    my ($self, %args) = @_;
+sub schedule_downtimes_p($self, %args) {
     _checkargs(\%args, qw/ start_time end_time comment objects /);
     # uncoverable condition true
     $args{author} //= $self->author;
-    ref $args{objects} eq 'ARRAY' or croak("`objects' arg must be an arrayref");
     my $filters = $self->_create_downtime_filters( $args{objects} );
 
     return Mojo::Promise->all(
@@ -160,8 +154,7 @@ sub schedule_downtimes_p {
     );
 }
 
-sub _schedule_downtime_type {
-    my ($self, $type, $filters, $args) = @_;
+sub _schedule_downtime_type($self, $type, $filters, $args) {
     return unless $filters->{$type};
     return $self->_i2req_pd_p('POST',
         '/actions/schedule-downtime',
@@ -169,13 +162,12 @@ sub _schedule_downtime_type {
             type => $type,
             joins => [ "host.name" ],
             filter => $filters->{$type},
-            map { $_ => $args->{$_} } qw/ author start_time end_time comment duration fixed /
+            %$args{ grep { exists $args->{$_} } qw/ author start_time end_time comment duration fixed / },
         },
     );
 }
 
-sub remove_downtimes_p {
-    my ($self, %args) = @_;
+sub remove_downtimes_p($self, %args) {
     my $p;
 
     if( defined $args{downtime} ) {
@@ -195,8 +187,6 @@ sub remove_downtimes_p {
             { Downtime => _filter_expr( 'downtime.__name', $args{name} // $args{names} ) }
         );
     } else {
-        ref $args{objects} eq 'ARRAY'
-            or croak("`objects' arg must be an arrayref");
         my $filters = $self->_create_downtime_filters( $args{objects} );
         my @results;
         $p = Mojo::Promise->all(
@@ -208,8 +198,7 @@ sub remove_downtimes_p {
     return $p->then( $resolve );
 }
 
-sub _make_resolve_cb {
-    my ($resultclass) = @_;
+sub _make_resolve_cb($resultclass) {
     return sub {
         return [
             map {
@@ -219,8 +208,7 @@ sub _make_resolve_cb {
     };
 }
 
-sub _remove_downtime_type {
-    my ($self, $type, $filters) = @_;
+sub _remove_downtime_type($self, $type, $filters) {
     state $joins = {
         Host => [ 'host.name' ],
         Service => [ 'host.name', 'service.name' ],
@@ -236,8 +224,7 @@ sub _remove_downtime_type {
     );
 }
 
-sub send_custom_notification_p {
-    my ($self, %args) = @_;
+sub send_custom_notification_p($self, %args) {
     _checkargs(\%args, qw/ comment /);
     _checkargs_any(\%args, qw/ host service /);
 
@@ -256,8 +243,7 @@ sub send_custom_notification_p {
     );
 }
 
-sub set_notifications_p {
-    my ($self, %args) = @_;
+sub set_notifications_p($self, %args) {
     _checkargs(\%args, qw/ state /);
     _checkargs_any(\%args, qw/ host service /);
     my $uri_object = $args{service} ? 'services' : 'hosts';
@@ -271,16 +257,13 @@ sub set_notifications_p {
     );
 }
 
-sub query_app_attrs_p {
-    my ($self) = @_;
-
+sub query_app_attrs_p($self) {
     return $self->_i2req_pd_p('GET', "/status/IcingaApplication",)->then(
        sub { shift->[0]{status}{icingaapplication}{app} }
     );
 }
 
-sub set_app_attrs_p {
-    my ($self, %args) = @_;
+sub set_app_attrs_p($self, %args) {
     state $legal_attrs = {
         map { $_ => 1 } qw/ event_handlers flapping host_checks
         notifications perfdata service_checks /
@@ -304,37 +287,32 @@ sub set_app_attrs_p {
     );
 }
 
-sub set_global_notifications_p {
-    my ($self, $state) = @_;
+sub set_global_notifications_p($self, $state) {
     $self->set_app_attrs_p( notifications => $state );
 }
 
-sub query_host_p {
-    my ($self, %args) = @_;
+sub query_host_p($self, %args) {
     _checkargs(\%args, qw/ host /);
     return $self->query_hosts_p( hosts => $args{host} )->then(
         sub { shift->[0] }
     );
 }
 
-sub query_hosts_p {
-    my ($self, %args) = @_;
+sub query_hosts_p($self, %args) {
     _checkargs(\%args, qw/ hosts /);
     return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => _filter_expr( "host.name", $args{hosts} ) },
     );
 }
 
-sub query_child_hosts_p {
-    my ($self, %args) = @_;
+sub query_child_hosts_p($self, %args) {
     _checkargs(\%args, qw/ host /);
     return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => "\"$args{host}\" in host.vars.parents" }
     );
 }
 
-sub query_parent_hosts_p {
-    my ($self, %args) = @_;
+sub query_parent_hosts_p($self, %args) {
     $args{hosts} //= delete $args{host};
     my $expand = delete $args{expand};
     my $p = $self->query_hosts_p( %args )->then(
@@ -347,25 +325,22 @@ sub query_parent_hosts_p {
     );
 }
 
-sub query_services_p {
-    my ($self, %args) = @_;
+sub query_services_p($self, %args) {
     _checkargs(\%args, qw/ services /);
     return $self->_i2req_pd_p('GET', '/objects/services',
         { filter => _filter_expr( "service.name", $args{services} ) },
     );
 }
 
-sub query_downtimes_p {
-    my ($self, %args) = @_;
+sub query_downtimes_p($self, %args) {
     my $filter = _dtquery2filter( %args );
     return $self->_i2req_pd_p('GET', '/objects/downtimes',
         { $filter ? ( filter => $filter) : () }
     );
 }
 
-sub on {
-    my ($self, $ev, $cb) = @_;
-    my $ie = $self->icinga_events;
+sub on($self, $ev, $cb) {
+    my $ie = $self->_icinga_events;
 
     my ($event, $filter) = split /:/, $ev, 2;
     my $filter_key = $filter // '';
@@ -380,9 +355,8 @@ sub on {
     return $self->SUPER::on( $ev, $cb );
 }
 
-sub unsubscribe {
-    my ($self, $ev, $cb) = @_;
-    my $ie = $self->{icinga_events};
+sub unsubscribe($self, $ev, $cb) {
+    my $ie = $self->_icinga_events;
 
     my ($event, $filter) = split /:/, $ev, 2;
     my $filter_key = $filter // '';
@@ -399,9 +373,7 @@ sub unsubscribe {
 
 # Try to resubscribe to all events named as keys in %$ev and return a started transaction.
 # If there are none, close the running transaction, delete the meta keys and return false.
-sub _try_resubscribe_all {
-    my ($self, $ev, $filter) = @_;
-
+sub _try_resubscribe_all($self, $ev, $filter) {
     my @events = grep { substr( $_, 0, 1 ) ne '_' } keys %$ev;
     if( @events ) {
         return $ev->{_running} = $self->_subscribe(
@@ -417,8 +389,7 @@ sub _try_resubscribe_all {
 }
 
 # Subscribe to a number of events sharing a filter expression
-sub _subscribe {
-    my ($self, $type, $filter, $queue) = @_;
+sub _subscribe($self, $type, $filter, $queue) {
     my @filter = defined $filter ? ( filter => $filter ) : ();
 
     weaken($self);
@@ -448,14 +419,12 @@ sub _subscribe {
 }
 
 # Create a new queue ID from author and UUID
-sub _new_queue {
-    my ($self) = @_;
+sub _new_queue($self) {
     require UUID::Tiny;
     $self->author . '-' . UUID::Tiny::create_uuid_as_string(UUID::Tiny::UUID_V1());
 }
 
-sub _start_i2req_p {
-    my ( $self, $method, $path, $params, $data, $streaming_cb ) = @_;
+sub _start_i2req_p($self, $method, $path, $params, $data, $streaming_cb) {
     my $tx = Monitoring::Icinga2::Client::Mojo::Transaction->new(
         $self->ua->build_tx(
             $method,
@@ -473,8 +442,7 @@ sub _start_i2req_p {
     return $self->_start_retrying_p( $tx );
 }
 
-sub _start_retrying_p {
-    my ($self, $tx, $promise) = @_;
+sub _start_retrying_p($self, $tx, $promise) {
     $promise //= Mojo::Promise->new;
 
     $self->ua->start_p( $tx )->then(
@@ -502,8 +470,7 @@ sub _start_retrying_p {
     return $promise;
 }
 
-sub _event_to_object {
-    my ($res) = @_;
+sub _event_to_object($res) {
     my $type = $res->{type};
     $type = 'Generic' unless exists $EVENT_STREAM_TYPES->{$type};
     return "Monitoring::Icinga2::Client::Mojo::Event::$type"->new( $res );
@@ -533,8 +500,7 @@ for my $method (qw/
     );
 }
 
-sub _validate_stream_types {
-    my ($types) = @_;
+sub _validate_stream_types($types) {
     our $EVENT_STREAM_TYPES;
 
     for( ref $types ) {
@@ -553,25 +519,23 @@ sub _validate_stream_types {
 }
 
 # Send an Icinga2 request with postdata and return a promise on the result
-sub _i2req_pd_p {
-    my ($self, $method, $path, $postdata) = @_;
+sub _i2req_pd_p($self, $method, $path, $postdata) {
     return $self->i2req_p( $method, $path, undef, [ json => $postdata ] )->then(
         sub { shift->{results} // croak( "Missing `results' field in Icinga response" ) }
     );
 }
 
 # Construct a Mojo::URL object using the $path fragment and GET $params
-sub _urlobj {
-    my ($self, $path, $params) = @_;
-
+sub _urlobj($self, $path, $params) {
     my $u = Mojo::URL->new( $self->url );
     $path = "/$path" unless substr( $path, 0, 1) eq '/';
-    $u->path->merge( 'v' . $self->api_version . $path );
-    $u->query->merge( @$params ) if defined $params;
+    $u->path->merge( 'v1' . $path );
+    $u->query->merge( $params ) if defined $params;
     return $u;
 }
 
-# Make sure that all keys are defined in the hash referenced by the first arg
+# Make sure that all specified keys are defined in the hash referenced by the
+# first arg
 sub _checkargs {
     my $args = shift;
 
@@ -582,7 +546,8 @@ sub _checkargs {
     );
 }
 
-# Make sure at least one key is defined in the hash referenced by the first arg
+# Make sure at least one of the specified keys is defined in the hash
+# referenced by the first arg
 sub _checkargs_any {
    my $args = shift;
 
@@ -592,7 +557,8 @@ sub _checkargs_any {
    );
 }
 
-# Make sure at most one of the keys is defined in the hash referenced by the first arg
+# Make sure at most one of the specified keys is defined in the hash
+# referenced by the first arg
 sub _checkargs_single {
     my $o = shift;
     1 < grep { defined $o->{$_} } @_
@@ -604,8 +570,7 @@ sub _checkargs_single {
 
 # Create a simple filter for a hostname in $args->{host} and optionally a
 # service name in $args->{service}
-sub _create_filter {
-    my $args = shift;
+sub _create_filteri($args) {
     defined $args->{host} or croak(
         sprintf( "missing or undefined argument `host' to %s()", (caller(1))[3] )
     );
@@ -616,8 +581,8 @@ sub _create_filter {
 
 # Builds up to two complex filter expressions from a list of downtime object hashes,
 # returned under the keys "Host" and/or "Service" in a hashref.
-sub _create_downtime_filters {
-    my ($self, $objects) = @_;
+sub _create_downtime_filters($self, $objects) {
+    ref $objects eq 'ARRAY' or croak("`objects' arg must be an arrayref");
     my @filters = map { _dtobj2filter( $_ ) } @$objects;
     return {
         map { _disjunction( $_, @filters ) } qw/ host service /
@@ -635,8 +600,7 @@ sub _disjunction {
 
 # Turns a hashref describing a downtime-specific filter into an Icinga2
 # filter expression
-sub _dtobj2filter {
-    my ($o) = @_;
+sub _dtobj2filter($o) {
     ref $o eq 'HASH' or croak("filter definition must be a hash");
     _checkargs_single( $o, qw/ host hostglob hostre / );
     _checkargs_single( $o, qw/ service serviceglob servicere services / );
@@ -663,8 +627,7 @@ sub _dtobj2filter {
 }
 
 # Turn a downtime query into a filter expression
-sub _dtquery2filter {
-    my %q = @_;
+sub _dtquery2filter(%q) {
     my @exprs;
     # allow host/service as aliases for host_name/service_name
     exists $q{$_} and $q{$_.'_name'} = delete $q{$_} for qw/ host service /;
@@ -684,8 +647,7 @@ sub _dtquery2filter {
 
 # Returns a single host or service filter expression based on a description hash
 # and the required type
-sub _typeexpr {
-    my ($type, $o) = @_;
+sub _typeexpr($type, $o) {
     defined $o->{$type}        and return '(' . _filter_expr( "$type.name", $o->{$type} ) .')';
     defined $o->{$type.'glob'} and return "match(\"$o->{$type.'glob'}\",$type.name)";
     defined $o->{$type.'re'}   and return "regex(\"$o->{$type.'re'}\",$type.name)";
@@ -694,16 +656,14 @@ sub _typeexpr {
 
 # Return an == or `in' expression depending on the type of argument.
 # Only scalars and arrayrefs make sense!
-sub _filter_expr {
-    my ($type, $arg) = @_;
+sub _filter_expr($type, $arg) {
     return "$type==\"$arg\"" unless ref $arg;
     return "$type in [" . join( ',', map { "\"$_\"" } @$arg ) . ']';
 }
 
 # From a callback coderef, create a new one that can be called with arbitrary
 # chunks of text and will pass it on line by line to the original one.
-sub _callback_by_line {
-    my ($cb) = @_;
+sub _callback_by_line($cb) {
     my $acc;
     return sub {
         my $bytes = $_[1] // return;
