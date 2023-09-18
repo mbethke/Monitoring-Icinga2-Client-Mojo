@@ -410,7 +410,10 @@ sub _subscribe($self, $type, $filter, $queue) {
         read => _callback_by_line(
             sub {
                 my $msg = decode_json(shift);
-                $self->emit( $msg->{type} . (defined $filter ? ":$filter" : ""), _event_to_object( $msg ) );
+                $self->emit(
+                    $msg->{type} . (defined $filter ? ":$filter" : ""),
+                    _event_to_object( $msg )
+                );
             }
         )
     );

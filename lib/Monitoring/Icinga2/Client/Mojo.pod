@@ -44,6 +44,7 @@ error. Unless otherwise noted, each (obviously except for the constructor) has a
 corresponding method with a 'C<_p>' suffix that returns a L<Mojo::Promise>.
 
 =head2 new
+
   Monitoring::Icinga2::Client::Mojo->new(
     url => 'https://my.monitoring.system/icinga/',
   );
@@ -53,6 +54,7 @@ the above attributes.
 
 
 =head2 i2req
+  
   $c->i2req_p( 'GET', '/objects/hosts' );
 
 This is the lowest-level request function that is usually too unwieldy to use
@@ -84,6 +86,7 @@ L<Mojo::UserAgent/build_tx>.
 The resolved promise receives a decoded version of Icinga2's JSON response.
 
 =head2 query_p
+  
   $result = $c->query_p(
     '/objects/services', 'service in ["fooservice","barservice"]'
   );
@@ -92,6 +95,7 @@ The lowest-level generally useful query function, takes only a URL path and an
 Icinga filter expression.
 
 =head2 schedule_downtimes
+  
   $dtobjs = $c->schedule_downtimes(
      start_time => 1676479213,
      end_time   => 1676482813,
@@ -146,6 +150,7 @@ The number of individual downtimes may well be larger than the number of
 C<objects>.
 
 =head2 remove_downtimes
+  
   $c->remove_downtimes( downtime => 'myhost!COLLECTD_DF!becd19aa-dbf2-40b5-a4f8-39c954222f34' );
   $c->remove_downtimes( downtime => $dtobj );
 
@@ -159,8 +164,6 @@ its unique name as a string, or an array of names.
 
 =item C<name> or C<names>: unique downtime name as a string, or several as an
 array (C<name> and C<names> are completely equivalent)
-
-=item C<downtime>
 
 =back
 
@@ -180,6 +183,7 @@ The following hash-style arguments are supported:
 =back
 
 =head2 set_notifications
+  
   $c->set_notifications( state => 1, host => 'myhost' );
 
 Turn notifications for the selected host or service on or off.
@@ -196,7 +200,8 @@ The following hash-style arguments are supported:
 =back
 
 =head2 query_app_attrs
-    $c->query_app_attrs;
+  
+  $c->query_app_attrs;
 
     my ($self) = @_;
 
@@ -206,6 +211,7 @@ The following hash-style arguments are supported:
 }
 
 =head2 set_app_attrs
+
     my ($self, %args) = @_;
     state $legal_attrs = {
         map { $_ => 1 } qw/ event_handlers flapping host_checks
@@ -231,12 +237,14 @@ The following hash-style arguments are supported:
 }
 
 =head2 set_global_notifications
+
     my ($self, $state) = @_;
     $self->set_app_attrs_p( notifications => $state );
 }
 
 =head2 query_hosts
-    my ($self, %args) = @_;
+  
+  my ($self, %args) = @_;
     _checkargs(\%args, qw/ hosts /);
     return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => _filter_expr( "host.name", $args{hosts} ) },
@@ -244,7 +252,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 query_child_hosts
-    my ($self, %args) = @_;
+  
+  my ($self, %args) = @_;
     _checkargs(\%args, qw/ host /);
     return $self->_i2req_pd_p( 'GET', '/objects/hosts',
         { filter => "\"$args{host}\" in host.vars.parents" }
@@ -252,7 +261,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 query_parent_hosts
-    my ($self, %args) = @_;
+  
+  my ($self, %args) = @_;
     $args{hosts} //= delete $args{host};
     my $expand = delete $args{expand};
     my $p = $self->query_hosts_p( %args )->then(
@@ -266,7 +276,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 query_services
-    my ($self, %args) = @_;
+  
+  my ($self, %args) = @_;
     _checkargs(\%args, qw/ services /);
     return $self->_i2req_pd_p('GET', '/objects/services',
         { filter => _filter_expr( "service.name", $args{services} ) },
@@ -274,7 +285,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 query_downtimes
-    my ($self, %args) = @_;
+  
+  my ($self, %args) = @_;
     my $filter = _dtquery2filter( %args );
     return $self->_i2req_pd_p('GET', '/objects/downtimes',
         { $filter ? ( filter => $filter) : () }
@@ -282,7 +294,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 on
-    my ($self, $ev, $cb) = @_;
+  
+  my ($self, $ev, $cb) = @_;
     my $ie = $self->icinga_events;
 
     my ($event, $filter) = split /:/, $ev, 2;
@@ -299,7 +312,8 @@ The following hash-style arguments are supported:
 }
 
 =head2 unsubscribe
-    my ($self, $ev, $cb) = @_;
+  
+  my ($self, $ev, $cb) = @_;
     my $ie = $self->{icinga_events};
 
     my ($event, $filter) = split /:/, $ev, 2;
@@ -316,8 +330,8 @@ The following hash-style arguments are supported:
 }
 
 
-our $EVENT_STREAM_TYPES = {
-    AcknowledgementSet => [ qw/ host timestamp / ],
+	our $EVENT_STREAM_TYPES = {
+  AcknowledgementSet => [ qw/ host timestamp / ],
     AcknowledgementCleared => [ qw/ host timestamp / ],
     CheckResult => {
         host => 'shift->{host}',
@@ -394,5 +408,5 @@ our $EVENT_STREAM_TYPES = {
         users => '[ @{ shift->{users} // [] } ]',
     },
     StateChange => [qw/ host service state state_type timestamp /],
-};
+
 1;
