@@ -1,0 +1,398 @@
+# ABSTRACT: Synchronous/asynchronous REST client for Icinga2
+
+=head1 FUNCTION
+
+Mojo-based sync/async client for Icinga2's REST interface
+
+=head1 SYNOPSIS
+
+  use Monitoring::Icinga2::Client::Mojo;
+
+  $c = Monitoring::Icinga2::Client::Mojo->new(
+    url => 'https://my.monitoring.system/icinga/',
+  );
+
+=head1 ATTRIBUTES
+
+=head2 author
+
+A human-readable name to identify objects in Icinga. Defaults to the result of
+L<getlogin> or L<getpwuid>C<($<)>.
+
+=head2 retries
+
+How often to retry requests that failed due to network problems or similar.
+Defaults to 0, i.e. no retrying.
+
+=head2 retry_delay
+
+Wait this many seconds between retries. Defaults to 5.
+
+=head2 ua
+
+A L<Mojo::UserAgent> object. Will be set up for you, or you can pass in your
+own should you happen to have one at hand.
+
+=head2 url
+
+The base URL of your Icinga server.
+
+=head1 METHODS
+
+All methods ilisted here are the synchronous versions that throw an exception on
+error. Unless otherwise noted, each (obviously except for the constructor) has a
+corresponding method with a 'C<_p>' suffix that returns a L<Mojo::Promise>.
+
+=head2 new
+  Monitoring::Icinga2::Client::Mojo->new(
+    url => 'https://my.monitoring.system/icinga/',
+  );
+
+The constructor passes all arguments on to L<Mojo::UserAgent/new>, except for
+the above attributes.
+
+
+=head2 i2req
+  $c->i2req_p( 'GET', '/objects/hosts' );
+
+This is the lowest-level request function that is usually too unwieldy to use
+directly. First have a look at the methods below.
+
+Required arguments are:
+
+=over 4
+
+=item an HTTP method such as C<GET> or C<POST>
+
+=item a path relative to the base URL the constructor received
+
+=back
+
+The following arguments are optional:
+
+=over 4
+
+=item a hashref with query parameters
+
+=item an arrayref with request data, will be directly passed to
+L<Mojo::UserAgent/build_tx>.
+
+=item a coderef that will be called on incoming streaming events
+
+=back
+
+The resolved promise receives a decoded version of Icinga2's JSON response.
+
+=head2 query_p
+  $result = $c->query_p(
+    '/objects/services', 'service in ["fooservice","barservice"]'
+  );
+
+The lowest-level generally useful query function, takes only a URL path and an
+Icinga filter expression.
+
+=head2 schedule_downtimes
+  $dtobjs = $c->schedule_downtimes(
+     start_time => 1676479213,
+     end_time   => 1676482813,
+     comment    => 'Just testing',
+     objects    => [
+        { host   => 'backend', services => 1 },
+        { hostre => 'web[0-5]', service => [ 'HTTP', 'HTTP_8080' ] },
+        { serviceglob => 'COLLECTD_*' },
+     ]
+   );
+
+Sets a number of downtimes. The following hash-style arguments are supported:
+
+=over 4
+
+=item C<start_time> Mandatory start time for the downtime in Unix timestamp format.
+
+=item C<end_time> Same as C<start_time>.
+
+=item C<duration> Downtime duration if C<flexible> is true.
+
+=item C<comment> Mandatory human-readable description of the downtime.
+
+=item C<objects> Describes what to set the downtime on as a an array of hashes,
+each of which may contain the following keys:
+
+=over 4
+
+=item C<host>: a plain hostname
+
+=item C<hostglob>: a shell-style globbing pattern for hostnames
+
+=item C<hostre>: a regular expression for hostnames
+
+=item C<services>: a boolean value, when true, all the specified host's services
+will be downtimed as well.
+
+=item C<service>: either a plain string containing a service name or an arrayref
+with several of those.
+
+=item C<serviceglob>: a shell-style globbing pattern for service names
+
+=item C<revicere>: a regular expression for service names
+
+=back
+
+=back
+
+The method returns a reference to an array of
+L<Monitoring::Icinga2::Client::Mojo::Downtime> objects describing what was set.
+The number of individual downtimes may well be larger than the number of
+C<objects>.
+
+=head2 remove_downtimes
+  $c->remove_downtimes( downtime => 'myhost!COLLECTD_DF!becd19aa-dbf2-40b5-a4f8-39c954222f34' );
+  $c->remove_downtimes( downtime => $dtobj );
+
+Removes downtimes by one of several criteria. The following hash-style
+arguments are supported:
+
+=over 4
+
+=item C<downtime>: a downtime object as returned by L</schedule_downtimes>,
+its unique name as a string, or an array of names.
+
+=item C<name> or C<names>: unique downtime name as a string, or several as an
+array (C<name> and C<names> are completely equivalent)
+
+=item C<downtime>
+
+=back
+
+=head2 send_custom_notification
+
+Send a custom notification to all recipients configured for a particular object.
+The following hash-style arguments are supported:
+
+=over 4
+
+=item C<comment>: Mandatory message string
+
+=item C<host>: hostname to notify for; alternative to C<service>
+
+=item C<service>: service name to notify for; alternative to C<host>
+
+=back
+
+=head2 set_notifications
+  $c->set_notifications( state => 1, host => 'myhost' );
+
+Turn notifications for the selected host or service on or off.
+The following hash-style arguments are supported:
+
+=over 4
+
+=item C<state>: boolean for "on" or "off".
+
+=item C<host>: host to work on; alternative to C<service>.
+
+=item C<service>: service to work on; alternative to C<host>.
+
+=back
+
+=head2 query_app_attrs
+    $c->query_app_attrs;
+
+    my ($self) = @_;
+
+    return $self->_i2req_pd_p('GET', "/status/IcingaApplication",)->then(
+       sub { shift->[0]{status}{icingaapplication}{app} }
+    );
+}
+
+=head2 set_app_attrs
+    my ($self, %args) = @_;
+    state $legal_attrs = {
+        map { $_ => 1 } qw/ event_handlers flapping host_checks
+        notifications perfdata service_checks /
+    };
+
+    _checkargs_any(\%args, keys %$legal_attrs);
+    my @unknown_attrs = grep { not exists $legal_attrs->{$_} } keys %args;
+    @unknown_attrs and croak(
+        sprintf "Unknown attributes: %s; legal attributes are: %s",
+        join(",", sort @unknown_attrs),
+        join(",", sort keys %$legal_attrs),
+    );
+
+    return $self->_i2req_pd_p('POST',
+        '/objects/icingaapplications/app',
+        {
+            attrs => {
+                map { 'enable_' . $_ => !!$args{$_} } keys %args
+            },
+        }
+    );
+}
+
+=head2 set_global_notifications
+    my ($self, $state) = @_;
+    $self->set_app_attrs_p( notifications => $state );
+}
+
+=head2 query_hosts
+    my ($self, %args) = @_;
+    _checkargs(\%args, qw/ hosts /);
+    return $self->_i2req_pd_p( 'GET', '/objects/hosts',
+        { filter => _filter_expr( "host.name", $args{hosts} ) },
+    );
+}
+
+=head2 query_child_hosts
+    my ($self, %args) = @_;
+    _checkargs(\%args, qw/ host /);
+    return $self->_i2req_pd_p( 'GET', '/objects/hosts',
+        { filter => "\"$args{host}\" in host.vars.parents" }
+    );
+}
+
+=head2 query_parent_hosts
+    my ($self, %args) = @_;
+    $args{hosts} //= delete $args{host};
+    my $expand = delete $args{expand};
+    my $p = $self->query_hosts_p( %args )->then(
+        sub {
+            my $r = shift->[0] // return [];
+            my $parents = $r->{attrs}{vars}{parents} // [];
+            return $parents unless $expand;
+            return $self->query_hosts_p( hosts => $parents );
+        }
+    );
+}
+
+=head2 query_services
+    my ($self, %args) = @_;
+    _checkargs(\%args, qw/ services /);
+    return $self->_i2req_pd_p('GET', '/objects/services',
+        { filter => _filter_expr( "service.name", $args{services} ) },
+    );
+}
+
+=head2 query_downtimes
+    my ($self, %args) = @_;
+    my $filter = _dtquery2filter( %args );
+    return $self->_i2req_pd_p('GET', '/objects/downtimes',
+        { $filter ? ( filter => $filter) : () }
+    );
+}
+
+=head2 on
+    my ($self, $ev, $cb) = @_;
+    my $ie = $self->icinga_events;
+
+    my ($event, $filter) = split /:/, $ev, 2;
+    my $filter_key = $filter // '';
+    if( exists $EVENT_STREAM_TYPES->{$event} ) {
+        if( $ie->{$filter_key}{$event} ) {
+            $ie->{$filter_key}{$event}++;
+        } else {
+            $ie->{$filter_key}{$event}++;
+            $self->_try_resubscribe_all( $ie->{$filter_key}, $filter );
+        }
+    }
+    return $self->SUPER::on( $ev, $cb );
+}
+
+=head2 unsubscribe
+    my ($self, $ev, $cb) = @_;
+    my $ie = $self->{icinga_events};
+
+    my ($event, $filter) = split /:/, $ev, 2;
+    my $filter_key = $filter // '';
+
+    if( exists $EVENT_STREAM_TYPES->{$event} ) {
+        if( 0 == --$ie->{$filter_key}{$event} ) {
+            delete $ie->{$filter_key}{$event};
+            $self->_try_resubscribe_all( $ie->{$filter_key}, $filter )
+                or delete $ie->{$filter_key};
+        }
+    }
+    return $self->SUPER::unsubscribe( $ev, $cb );
+}
+
+
+our $EVENT_STREAM_TYPES = {
+    AcknowledgementSet => [ qw/ host timestamp / ],
+    AcknowledgementCleared => [ qw/ host timestamp / ],
+    CheckResult => {
+        host => 'shift->{host}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        check_source => 'shift->{check_result}{check_source}',
+        state => 'shift->{check_result}{state}',
+        check_source => 'shift->{check_result}{check_source}',
+    },
+    CommentAdded => [ qw/ host timestamp / ],
+    CommentRemoved => [ qw/ host timestamp / ],
+    DowntimeAdded => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        end_time => 'shift->{downtime}{end_time}',
+        fixed => '!!shift->{downtime}{fixed}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        start_time => 'shift->{downtime}{start_time}',
+        timestamp => 'shift->{timestamp}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+        version => 'shift->{downtime}{version}',
+        was_cancelled => '!!shift->{downtime}{was_cancelled}',
+        zone => 'shift->{downtime}{zone}',
+    },
+    DowntimeRemoved => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        end_time => 'shift->{downtime}{end_time}',
+        fixed => '!!shift->{downtime}{fixed}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        start_time => 'shift->{downtime}{start_time}',
+        timestamp => 'shift->{timestamp}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+        version => 'shift->{downtime}{version}',
+        was_cancelled => '!!shift->{downtime}{was_cancelled}',
+        zone => 'shift->{downtime}{zone}',
+    },
+    DowntimeStarted => {
+        host => 'shift->{host}',
+        author => 'shift->{author}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        text => 'shift->{text}',
+        users => '[ @{ shift->{users} // [] } ]',
+    },
+    DowntimeTriggered => {
+        author => 'shift->{downtime}{author}',
+        comment => 'shift->{downtime}{comment}',
+        duration => 'shift->{downtime}{duration}',
+        host_name => 'shift->{downtime}{host_name}',
+        legacy_id => 'shift->{downtime}{legacy_id}',
+        name => 'shift->{downtime}{name}',
+        service_name => 'shift->{downtime}{service_name}',
+        timestamp => 'shift->{timestamp}',
+        triggered_by => 'shift->{downtime}{triggered_by}',
+        triggers => '[ @{ shift->{downtime}{triggers} // [] } ]',
+    },
+    Generic => [],
+    Notification => {
+        author => 'shift->{author}',
+        host => 'shift->{host}',
+        service => 'shift->{service}',
+        timestamp => 'shift->{timestamp}',
+        notification_type => 'shift->{notification_type}',
+        text => 'shift->{text}',
+        users => '[ @{ shift->{users} // [] } ]',
+    },
+    StateChange => [qw/ host service state state_type timestamp /],
+};
+1;
